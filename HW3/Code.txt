@@ -1,0 +1,163 @@
+-----------------------load_data.py-----------------------
+
+
+import pandas as pd
+from google.cloud import bigtable
+from google.cloud.bigtable.row import DirectRow
+
+
+client = bigtable.Client(admin=True)
+instance = client.instance("ev-bigtable")
+table = instance.table("ev-population")
+
+df = pd.read_csv("Electric_Vehicle_Population_Data.csv")
+df.columns = [col.strip().lower().replace(" ", "_") for col in df.columns]
+
+bigtable_columns = ["make", "model", "model_year", "electric_range", "city", "county"]
+
+batch_size = 100
+batch = []
+
+for index, row_data in df.iterrows():
+    row_key = str(row_data["dol_vehicle_id"]).encode("utf-8")
+    bigtable_row = DirectRow(row_key=row_key, table=table)
+
+    for col in bigtable_columns:
+        val = row_data.get(col)
+
+        if pd.notna(val):
+            bigtable_row.set_cell("ev_info", col, str(val).encode("utf-8"))
+
+    batch.append(bigtable_row)
+
+    if len(batch) == batch_size:
+        table.mutate_rows(batch)
+        print(f"{index + 1} rows")
+        batch = []
+
+if batch:
+    table.mutate_rows(batch)
+    print(f"Remaining {len(batch)} rows")
+
+print("Done")
+
+
+__________________________________________________________________________________________________________________________________________________________________
+-----------------------app.py-----------------------
+
+
+from flask import Flask, request
+from google.cloud import bigtable
+
+app = Flask(__name__)
+
+client = bigtable.Client(admin=True)
+instance = client.instance("ev-bigtable")
+table = instance.table("ev-population")
+
+
+# /rows: that returns the total number of entries in Bigtable
+@app.route("/rows")
+def rows():
+    total_rows = 0
+    rows = table.read_rows()
+
+    for row in rows:
+        total_rows += 1
+
+    return str(total_rows)
+
+
+# /Best-BMW: Find the count of BMW EVs with an electric range > 100 miles
+@app.route("/Best-BMW")
+def best_bmw():
+    bmw_ev_count = 0
+    rows = table.read_rows()
+    rows.consume_all()
+
+    for row in rows.rows.values():
+        ev_info_cells = row.cells["ev_info"]
+        make_cell = ev_info_cells.get("make".encode(), [])
+        electric_range_cell = ev_info_cells.get("electric_range".encode(), [])
+
+        if not make_cell or not electric_range_cell:
+            continue
+
+        make = make_cell[0].value.decode("utf-8").strip().lower()
+        electric_range = float(electric_range_cell[0].value.decode("utf-8").strip())
+
+        if make.lower() == "bmw" and float(electric_range) > 100:
+            bmw_ev_count += 1
+
+    return str(bmw_ev_count)
+
+
+# /tesla-owners: Retrieve the count of all Tesla vehicles registered in Seattle
+@app.route("/tesla-owners")
+def tesla_owners():
+    tesla_vehicle_count = 0
+    rows = table.read_rows()
+    rows.consume_all()
+
+    for row in rows.rows.values():
+        ev_info_cells = row.cells["ev_info"]
+        make_cell = ev_info_cells.get("make".encode(), [])
+        city_cell = ev_info_cells.get("city".encode(), [])
+
+        if not make_cell or not city_cell:
+            continue
+        
+        make = make_cell[0].value.decode("utf-8").strip()
+        city = city_cell[0].value.decode("utf-8").strip()
+
+        if make.lower() == "tesla" and city.lower() == "seattle":
+            tesla_vehicle_count += 1
+
+    return str(tesla_vehicle_count)
+
+
+# /update: Update the electric range of the vehicle with DOL Vehicle ID 257246118 to 200 miles. 
+@app.route("/update")
+def update():
+    row_key = b"257246118"
+    exact_vehicle_row = table.direct_row(row_key)
+    exact_vehicle_row.set_cell("ev_info", "electric_range", "200")
+    exact_vehicle_row.commit()
+    
+    return "Success"
+
+
+# /delete: Delete all records where the model year is less than 2014 and retrieve the count of remaining records. 
+@app.route("/delete")
+def delete():
+    rows = table.read_rows()
+    rows.consume_all()
+    delete_records_keys = []
+
+    for row in rows.rows.values():
+        ev_info_cells = row.cells["ev_info"]
+        model_year_cell = ev_info_cells.get("model_year".encode(), [])
+
+        if not model_year_cell:
+            continue
+
+        model_year = int(model_year_cell[0].value.decode("utf-8").strip())
+
+        if model_year < 2014:
+            delete_records_keys.append(row.row_key)
+
+    for key in delete_records_keys:
+        row = table.row(key)
+        row.delete()
+        row.commit()
+
+    remaining = table.read_rows()
+    remaining.consume_all()
+    remaining_records_count = len(remaining.rows)
+
+    return str(remaining_records_count)
+
+
+if __name__ == "__main__":
+    # sudo ~/.venv/bin/python3 app.py
+    app.run(host="0.0.0.0", port=80)
